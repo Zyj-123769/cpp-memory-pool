@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+# 同一分支的新推送取消旧的进行中任务
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release (gcc)
+            build_type: Release
+            cmake_opts: ""
+            tsan: false
+          - name: asan+ubsan (gcc)
+            build_type: Debug
+            cmake_opts: "-DENABLE_SANITIZERS=ON"
+            tsan: false
+          - name: tsan (gcc)
+            build_type: Debug
+            cmake_opts: "-DENABLE_TSAN=ON"
+            tsan: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 较新内核的高 vm.mmap_rnd_bits 会让 TSan 报 "unexpected memory mapping"，先降随机位。
+      - name: TSan ASLR workaround
+        if: ${{ matrix.tsan }}
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} ${{ matrix.cmake_opts }}
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      # sanitizer 命中时把日志留档，便于排查
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.name }}
+          path: build/Testing/Temporary/
+          if-no-files-found: ignore
