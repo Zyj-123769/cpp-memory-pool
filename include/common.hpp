@@ -43,8 +43,26 @@ inline void* SystemAlloc(size_t npages) {
 #ifdef _WIN32
     p = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 #else
-    p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) p = nullptr;
+    // Linux mmap 只保证 4KB 页对齐，但我们的「页」是 PAGE_SIZE（8KB）。
+    // 若返回地址低 PAGE_SHIFT 位非 0，PageIDFromAddr 算出的页号会偏移，
+    // 导致释放时 PageMap 反查不到正确 Span。这里多申请一页，对齐后把多余
+    // 的前导页 munmap 掉，保证返回值严格 PAGE_SIZE 对齐。
+    size_t alloc_bytes = bytes + PAGE_SIZE;
+    void* raw = mmap(nullptr, alloc_bytes, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) return nullptr;
+    uintptr_t addr = reinterpret_cast<uintptr_t>(raw);
+    uintptr_t aligned = (addr + PAGE_SIZE - 1) & ~(uintptr_t)(PAGE_SIZE - 1);
+    if (aligned != addr) {
+        munmap(raw, aligned - addr);   // 释放前导 gap
+    }
+    // 尾部若有多余字节（对齐后总长度不足 alloc_bytes），释放之
+    size_t used_end = aligned + bytes;
+    uintptr_t raw_end = addr + alloc_bytes;
+    if (used_end < raw_end) {
+        munmap(reinterpret_cast<void*>(used_end), raw_end - used_end);
+    }
+    p = reinterpret_cast<void*>(aligned);
 #endif
     if (p) SysAllocCalls().fetch_add(1, std::memory_order_relaxed);
     return p;
@@ -56,6 +74,7 @@ inline void SystemFree(void* p, size_t npages) {
     (void)npages;   // VirtualFree 不需要页数
     VirtualFree(p, 0, MEM_RELEASE);
 #else
+    // p 已保证 PAGE_SIZE 对齐（SystemAlloc 里处理过），直接 munmap 即可
     munmap(p, npages * PAGE_SIZE);
 #endif
     SysFreeCalls().fetch_add(1, std::memory_order_relaxed);
